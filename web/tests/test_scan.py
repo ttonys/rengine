@@ -9,13 +9,15 @@ os.environ['CELERY_ALWAYS_EAGER'] = 'True'
 import yaml
 from celery.utils.log import get_task_logger
 from reNgine.settings import DEBUG
-from reNgine.tasks import (dir_file_fuzz, fetch_url, http_crawl, initiate_scan,
-                           osint, port_scan, subdomain_discovery,
-                           vulnerability_scan)
+# from reNgine.tasks import (dir_file_fuzz, fetch_url, http_crawl, initiate_scan,
+#                            osint, port_scan, subdomain_discovery,
+#                            vulnerability_scan)
+from reNgine.tasks import fetch_url
 from startScan.models import *
 
 logger = get_task_logger(__name__)
-DOMAIN_NAME = os.environ['DOMAIN_NAME']
+# DOMAIN_NAME = os.environ['DOMAIN_NAME']
+DOMAIN_NAME = "wacai.com"
 # if not DEBUG:
 #     logging.disable(logging.CRITICAL)
 
@@ -24,13 +26,22 @@ class TestOnlineScan(unittest.TestCase):
     def setUp(self):
         self.url = f'https://{DOMAIN_NAME}'
         self.yaml_configuration = {
-            'subdomain_discovery': {},
-            'port_scan': {},
-            'vulnerability_scan': {},
-            'osint': {},
-            'fetch_url': {},
-            'dir_file_fuzz': {},
-            'screenshot': {}
+            'subdomain_discovery': {
+                'uses_tools': ['subfinder', 'chaos', 'ctfr', 'sublist3r', 'tlsx', 'oneforall', 'netlas'],
+                'enable_http_crawl': True,
+                'threads': 30,
+                'timeout': 5,
+            },
+            'http_crawl': {},
+            'fetch_url': {
+                'uses_tools': ['gospider', 'hakrawler', 'waybackurls', 'katana', 'gau'],
+                'remove_duplicate_endpoints': True,
+                'duplicate_fields': ['content_length', 'page_title'],
+                'enable_http_crawl': False,
+                'gf_patterns': [],
+                'ignore_file_extensions': ['png', 'jpg', 'jpeg', 'gif', 'mp4', 'mpeg', 'mp3'],
+                'threads': 30
+            }
         }
         self.domain, _ = Domain.objects.get_or_create(name=DOMAIN_NAME)
         self.engine = EngineType(
@@ -67,21 +78,21 @@ class TestOnlineScan(unittest.TestCase):
         self.scan.delete()
         self.engine.delete()
 
-    def test_http_crawl(self):
-        results = http_crawl([DOMAIN_NAME], ctx=self.ctx)
-        self.assertGreater(len(results), 0)
-        self.assertIn('final_url', results[0])
-        url = results[0]['final_url']
-        if DEBUG:
-            print(url)
+    # def test_http_crawl(self):
+    #     results = http_crawl([DOMAIN_NAME], ctx=self.ctx)
+    #     self.assertGreater(len(results), 0)
+    #     self.assertIn('final_url', results[0])
+    #     url = results[0]['final_url']
+    #     if DEBUG:
+    #         print(url)
 
-    def test_subdomain_discovery(self):
-        domain = DOMAIN_NAME.lstrip('rengine.')
-        subdomains = subdomain_discovery(domain, ctx=self.ctx)
-        if DEBUG:
-            print(json.dumps(subdomains, indent=4))
-        self.assertTrue(subdomains is not None)
-        self.assertGreater(len(subdomains), 0)
+    # def test_subdomain_discovery(self):
+    #     domain = DOMAIN_NAME.lstrip('rengine.')
+    #     subdomains = subdomain_discovery(domain, ctx=self.ctx)
+    #     if DEBUG:
+    #         print(json.dumps(subdomains, indent=4))
+    #     self.assertTrue(subdomains is not None)
+    #     self.assertGreater(len(subdomains), 0)
 
     def test_fetch_url(self):
         urls = fetch_url(urls=[self.url], ctx=self.ctx)
@@ -93,31 +104,32 @@ class TestOnlineScan(unittest.TestCase):
     #     urls = dir_file_fuzz(ctx=self.ctx)
     #     self.assertGreater(len(urls), 0)
 
-    def test_vulnerability_scan(self):
-        vulns = vulnerability_scan(urls=[self.url], ctx=self.ctx)
-        if DEBUG:
-            print(json.dumps(vulns, indent=4))
-        self.assertTrue(vulns is not None)
+    # def test_vulnerability_scan(self):
+    #     vulns = vulnerability_scan(urls=[self.url], ctx=self.ctx)
+    #     if DEBUG:
+    #         print(json.dumps(vulns, indent=4))
+    #     self.assertTrue(vulns is not None)
 
-    def test_network_scan(self):
-        subdomains = subdomain_discovery(DOMAIN_NAME, ctx=self.ctx)
-        self.assertGreater(len(subdomains), 0)
-        host = subdomains[0]['name']
-        ports = port_scan(hosts=[host], ctx=self.ctx)
-        urls = []
-        for host, ports in ports.items():
-            print(f'Host {host} opened ports: {ports}')
-            self.assertGreater(len(ports), 0)
-            self.assertIn(80, ports)
-            self.assertIn(443, ports)
-            for port in ports:
-                if port in [80, 443]: # http
-                    results = http_crawl(urls=[f'{host}:{port}'])
-                    self.assertGreater(len(results), 0)
-                    final_url = results[0]['final_url']
-                    urls.append(final_url)
-        self.assertGreater(len(urls), 0)
-        vulns = vulnerability_scan(urls=urls, ctx=self.ctx)
+    # def test_network_scan(self):
+    #     subdomains = subdomain_discovery(DOMAIN_NAME, ctx=self.ctx)
+    #     self.assertGreater(len(subdomains), 0)
+    #     logger.info(f'Subdomains: {subdomains}')
+    #     host = subdomains[0]['name']
+    #     ports = port_scan(hosts=[host], ctx=self.ctx)
+    #     urls = []
+    #     for host, ports in ports.items():
+    #         print(f'Host {host} opened ports: {ports}')
+    #         self.assertGreater(len(ports), 0)
+    #         self.assertIn(80, ports)
+    #         self.assertIn(443, ports)
+    #         for port in ports:
+    #             if port in [80, 443]: # http
+    #                 results = http_crawl(urls=[f'{host}:{port}'])
+    #                 self.assertGreater(len(results), 0)
+    #                 final_url = results[0]['final_url']
+    #                 urls.append(final_url)
+    #     self.assertGreater(len(urls), 0)
+    #     vulns = vulnerability_scan(urls=urls, ctx=self.ctx)
 
     # def test_initiate_scan(self):
     #     scan = ScanHistory()

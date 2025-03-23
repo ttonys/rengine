@@ -40,7 +40,15 @@ from targetApp.models import Domain
 Celery tasks.
 """
 
+# 配置 logger 格式，添加时间和代码位置
+formatter = logging.Formatter(
+    '%(asctime)s | %(pathname)s:%(lineno)d | %(levelname)s | %(message)s',
+    '%Y-%m-%d %H:%M:%S'
+)
+
 logger = get_task_logger(__name__)
+for handler in logger.handlers:
+    handler.setFormatter(formatter)
 
 
 #----------------------#
@@ -1931,21 +1939,23 @@ def fetch_url(self, urls=[], ctx={}, description=None):
 		discovered_urls = f.readlines()
 		self.notify(fields={'Discovered URLs': len(discovered_urls)})
 
+	# feat: 顺序执行太慢了，改为并发执行
 	# Some tools can have an URL in the format <URL>] - <PATH> or <URL> - <PATH>, add them
 	# to the final URL list
 	all_urls = []
-	for url in discovered_urls:
+	def process_url(url):
 		url = url.strip()
 		urlpath = None
 		base_url = None
-		if '] ' in url: # found JS scraped endpoint e.g from gospider
+		
+		if '] ' in url:
 			split = tuple(url.split('] '))
 			if not len(split) == 2:
 				logger.warning(f'URL format not recognized for "{url}". Skipping.')
-				continue
+				return None
 			base_url, urlpath = split
 			urlpath = urlpath.lstrip('- ')
-		elif ' - ' in url: # found JS scraped endpoint e.g from gospider
+		elif ' - ' in url:
 			base_url, urlpath = tuple(url.split(' - '))
 
 		if base_url and urlpath:
@@ -1954,9 +1964,36 @@ def fetch_url(self, urls=[], ctx={}, description=None):
 
 		if not validators.url(url):
 			logger.warning(f'Invalid URL "{url}". Skipping.')
+			return None
 
-		if url not in all_urls:
-			all_urls.append(url)
+		return url
+	with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+		results = list(filter(None, executor.map(process_url, discovered_urls)))
+		all_urls.extend(results)
+	all_urls = list(set(all_urls))
+	# for url in discovered_urls:
+	# 	url = url.strip()
+	# 	urlpath = None
+	# 	base_url = None
+	# 	if '] ' in url: # found JS scraped endpoint e.g from gospider
+	# 		split = tuple(url.split('] '))
+	# 		if not len(split) == 2:
+	# 			logger.warning(f'URL format not recognized for "{url}". Skipping.')
+	# 			continue
+	# 		base_url, urlpath = split
+	# 		urlpath = urlpath.lstrip('- ')
+	# 	elif ' - ' in url: # found JS scraped endpoint e.g from gospider
+	# 		base_url, urlpath = tuple(url.split(' - '))
+
+	# 	if base_url and urlpath:
+	# 		subdomain = urlparse(base_url)
+	# 		url = f'{subdomain.scheme}://{subdomain.netloc}{self.starting_point_path}'
+
+	# 	if not validators.url(url):
+	# 		logger.warning(f'Invalid URL "{url}". Skipping.')
+
+	# 	if url not in all_urls:
+	# 		all_urls.append(url)
 
 	# Filter out URLs if a path filter was passed
 	if self.starting_point_path:
@@ -2825,241 +2862,330 @@ def s3scanner(self, ctx={}, description=None):
 
 @app.task(name='http_crawl', queue='main_scan_queue', base=RengineTask, bind=True)
 def http_crawl(
-		self,
-		urls=[],
-		method=None,
-		recrawl=False,
-		ctx={},
-		track=True,
-		description=None,
-		is_ran_from_subdomain_scan=False,
-		should_remove_duplicate_endpoints=True,
-		duplicate_removal_fields=[]):
-	"""Use httpx to query HTTP URLs for important info like page titles, http
-	status, etc...
+        self,
+        urls=[],
+        method=None,
+        recrawl=False,
+        ctx={},
+        track=True,
+        description=None,
+        is_ran_from_subdomain_scan=False,
+        should_remove_duplicate_endpoints=True,
+        duplicate_removal_fields=[]):
+    """Use httpx to query HTTP URLs for important info like page titles, http
+    status, etc...
 
-	Args:
-		urls (list, optional): A set of URLs to check. Overrides default
-			behavior which queries all endpoints related to this scan.
-		method (str): HTTP method to use (GET, HEAD, POST, PUT, DELETE).
-		recrawl (bool, optional): If False, filter out URLs that have already
-			been crawled.
-		should_remove_duplicate_endpoints (bool): Whether to remove duplicate endpoints
-		duplicate_removal_fields (list): List of Endpoint model fields to check for duplicates
+    Args:
+        urls (list, optional): A set of URLs to check. Overrides default
+            behavior which queries all endpoints related to this scan.
+        method (str): HTTP method to use (GET, HEAD, POST, PUT, DELETE).
+        recrawl (bool, optional): If False, filter out URLs that have already
+            been crawled.
+        should_remove_duplicate_endpoints (bool): Whether to remove duplicate endpoints
+        duplicate_removal_fields (list): List of Endpoint model fields to check for duplicates
 
-	Returns:
-		list: httpx results.
-	"""
-	logger.info('Initiating HTTP Crawl')
-	if is_ran_from_subdomain_scan:
-		logger.info('Running From Subdomain Scan...')
-	cmd = '/go/bin/httpx'
-	cfg = self.yaml_configuration.get(HTTP_CRAWL) or {}
-	custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
-	'''
-	# TODO: Remove custom_header in next major release
-		support for custom_header will be remove in next major release, 
-		as of now it will be supported for backward compatibility
-		only custom_headers will be supported
-	'''
-	custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
-	if custom_header:
-		custom_headers.append(custom_header)
-	threads = cfg.get(THREADS, DEFAULT_THREADS)
-	follow_redirect = cfg.get(FOLLOW_REDIRECT, True)
-	self.output_path = None
-	input_path = f'{self.results_dir}/httpx_input.txt'
-	history_file = f'{self.results_dir}/commands.txt'
-	if urls: # direct passing URLs to check
-		if self.starting_point_path:
-			urls = [u for u in urls if self.starting_point_path in u]
+    Returns:
+        list: httpx results.
+    """
+    logger.info('Initiating HTTP Crawl')
+    if is_ran_from_subdomain_scan:
+        logger.info('Running From Subdomain Scan...')
+    
+    # 处理URL获取
+    input_path = f'{self.results_dir}/httpx_input.txt'
+    history_file = f'{self.results_dir}/commands.txt'
+    
+    if urls: # direct passing URLs to check
+        if self.starting_point_path:
+            urls = [u for u in urls if self.starting_point_path in u]
+            
+        # 检查是否需要批量处理（URLs数量超过10万）
+        BATCH_SIZE = 100000
+        if len(urls) > BATCH_SIZE:
+            logger.warning(f"大量URL检测: {len(urls)}条，将分批处理")
+            all_results = []
+            all_endpoint_ids = []
+            
+            # 分批处理
+            batch_count = len(urls) // BATCH_SIZE + (1 if len(urls) % BATCH_SIZE > 0 else 0)
+            for batch_index in range(batch_count):
+                start_index = batch_index * BATCH_SIZE
+                end_index = min(start_index + BATCH_SIZE, len(urls))
+                batch_urls = urls[start_index:end_index]
+                
+                logger.info(f"处理第 {batch_index + 1}/{batch_count} 批，{len(batch_urls)}条URL ({start_index+1}-{end_index})")
+                
+                # 为每个批次创建单独的输入文件
+                batch_input_path = f'{self.results_dir}/httpx_input_batch_{batch_index}.txt'
+                with open(batch_input_path, 'w') as f:
+                    f.write('\n'.join(batch_urls))
+                
+                # 处理当前批次
+                batch_results, batch_endpoint_ids = process_http_batch(
+                    self, batch_urls, batch_input_path, method, shell=True,
+                    history_file=history_file, scan_id=self.scan_id, 
+                    activity_id=self.activity_id, ctx=ctx
+                )
+                
+                # 合并结果
+                all_results.extend(batch_results)
+                all_endpoint_ids.extend(batch_endpoint_ids)
+                
+                # 清理批次输入文件
+                run_command(
+                    f'rm {batch_input_path}',
+                    shell=True,
+                    history_file=self.history_file,
+                    scan_id=self.scan_id,
+                    activity_id=self.activity_id)
+                
+            if should_remove_duplicate_endpoints:
+                # 一次性去重所有批次的结果
+                remove_duplicate_endpoints(
+                    self.scan_id,
+                    self.domain_id,
+                    self.subdomain_id,
+                    filter_ids=all_endpoint_ids
+                )
+            
+            return all_results
+        else:
+            with open(input_path, 'w') as f:
+                f.write('\n'.join(urls))
+    else:
+        urls = get_http_urls(
+            is_uncrawled=not recrawl,
+            write_filepath=input_path,
+            ctx=ctx
+        )
 
-		with open(input_path, 'w') as f:
-			f.write('\n'.join(urls))
-	else:
-		urls = get_http_urls(
-			is_uncrawled=not recrawl,
-			write_filepath=input_path,
-			ctx=ctx
-		)
-		# logger.debug(urls)
+    # exclude urls by pattern
+    if self.excluded_paths:
+        urls = exclude_urls_by_patterns(self.excluded_paths, urls)
 
-	# exclude urls by pattern
-	if self.excluded_paths:
-		urls = exclude_urls_by_patterns(self.excluded_paths, urls)
+    # If no URLs found, skip it
+    if not urls:
+        return []
 
-	# If no URLs found, skip it
-	if not urls:
-		return
+    # 执行标准的处理流程
+    results, endpoint_ids = process_http_batch(
+        self, urls, input_path, method, shell=True,
+        history_file=history_file, scan_id=self.scan_id, 
+        activity_id=self.activity_id, ctx=ctx
+    )
 
-	# Re-adjust thread number if few URLs to avoid spinning up a monster to
-	# kill a fly.
-	if len(urls) < threads:
-		threads = len(urls)
+    # Remove input file
+    run_command(
+        f'rm {input_path}',
+        shell=True,
+        history_file=self.history_file,
+        scan_id=self.scan_id,
+        activity_id=self.activity_id)
 
-	# Get random proxy
-	proxy = get_random_proxy()
+    if should_remove_duplicate_endpoints:
+        # Remove 'fake' alive endpoints that are just redirects to the same page
+        remove_duplicate_endpoints(
+            self.scan_id,
+            self.domain_id,
+            self.subdomain_id,
+            filter_ids=endpoint_ids
+        )
 
-	# Run command
-	cmd += f' -cl -ct -rt -location -td -websocket -cname -asn -cdn -probe -random-agent'
-	cmd += f' -t {threads}' if threads > 0 else ''
-	cmd += f' --http-proxy {proxy}' if proxy else ''
-	formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
-	if formatted_headers:
-		cmd += formatted_headers
-	cmd += f' -json'
-	cmd += f' -u {urls[0]}' if len(urls) == 1 else f' -l {input_path}'
-	cmd += f' -x {method}' if method else ''
-	cmd += f' -silent'
-	if follow_redirect:
-		cmd += ' -fr'
-	results = []
-	endpoint_ids = []
-	for line in stream_command(
-			cmd,
-			history_file=history_file,
-			scan_id=self.scan_id,
-			activity_id=self.activity_id):
+    return results
 
-		if not line or not isinstance(line, dict):
-			continue
+def process_http_batch(self, urls, input_path, method=None, shell=False, 
+                       history_file=None, scan_id=None, activity_id=None, ctx={}):
+    """处理单批次的HTTP URL检测
+    
+    Args:
+        urls (list): URL列表
+        input_path (str): 输入文件路径
+        其他参数与http_crawl相同
+        
+    Returns:
+        tuple: (结果列表, 端点ID列表)
+    """
+    cmd = '/go/bin/httpx'
+    cfg = self.yaml_configuration.get(HTTP_CRAWL) or {}
+    custom_headers = self.yaml_configuration.get(CUSTOM_HEADERS, [])
+    custom_header = self.yaml_configuration.get(CUSTOM_HEADER)
+    if custom_header:
+        custom_headers.append(custom_header)
+    threads = cfg.get(THREADS, DEFAULT_THREADS)
+    follow_redirect = cfg.get(FOLLOW_REDIRECT, True)
+    self.output_path = None
 
-		logger.debug(line)
+    # 如果URL数量少于线程数，调整线程数
+    if len(urls) < threads:
+        threads = len(urls)
 
-		# No response from endpoint
-		if line.get('failed', False):
-			continue
+    # 获取随机代理
+    proxy = get_random_proxy()
 
-		# Parse httpx output
-		host = line.get('host', '')
-		content_length = line.get('content_length', 0)
-		http_status = line.get('status_code')
-		http_url, is_redirect = extract_httpx_url(line)
-		page_title = line.get('title')
-		webserver = line.get('webserver')
-		cdn = line.get('cdn', False)
-		rt = line.get('time')
-		techs = line.get('tech', [])
-		cname = line.get('cname', '')
-		content_type = line.get('content_type', '')
-		response_time = -1
-		if rt:
-			response_time = float(''.join(ch for ch in rt if not ch.isalpha()))
-			if rt[-2:] == 'ms':
-				response_time = response_time / 1000
+    # 构建命令
+    cmd += f' -cl -ct -rt -location -td -websocket -cname -asn -cdn -probe -random-agent'
+    cmd += f' -t {threads}' if threads > 0 else ''
+    cmd += f' --http-proxy {proxy}' if proxy else ''
+    formatted_headers = ' '.join(f'-H "{header}"' for header in custom_headers)
+    if formatted_headers:
+        cmd += formatted_headers
+    cmd += f' -json'
+    cmd += f' -u {urls[0]}' if len(urls) == 1 else f' -l {input_path}'
+    cmd += f' -x {method}' if method else ''
+    cmd += f' -silent'
+    if follow_redirect:
+        cmd += ' -fr'
+        
+    # 执行命令并处理结果
+    results = []
+    endpoint_ids = []
+    
+    for line in stream_command(
+            cmd,
+            history_file=history_file,
+            scan_id=scan_id,
+            activity_id=activity_id):
 
-		# Create Subdomain object in DB
-		subdomain_name = get_subdomain_from_url(http_url)
-		subdomain, _ = save_subdomain(subdomain_name, ctx=ctx)
+        if not line or not isinstance(line, dict):
+            continue
 
-		if not subdomain:
-			continue
+        # 处理单个URL结果
+        result_data = process_httpx_line(self, line, cmd, ctx)
+        if result_data:
+            line_result, endpoint_id = result_data
+            results.append(line_result)
+            if endpoint_id:
+                endpoint_ids.append(endpoint_id)
+    
+    return results, endpoint_ids
 
-		# Save default HTTP URL to endpoint object in DB
-		endpoint, created = save_endpoint(
-			http_url,
-			crawl=False,
-			ctx=ctx,
-			subdomain=subdomain,
-			is_default=is_ran_from_subdomain_scan
-		)
-		if not endpoint:
-			continue
-		endpoint.http_status = http_status
-		endpoint.page_title = page_title
-		endpoint.content_length = content_length
-		endpoint.webserver = webserver
-		endpoint.response_time = response_time
-		endpoint.content_type = content_type
-		endpoint.save()
-		endpoint_str = f'{http_url} [{http_status}] `{content_length}B` `{webserver}` `{rt}`'
-		logger.warning(endpoint_str)
-		if endpoint and endpoint.is_alive and endpoint.http_status != 403:
-			self.notify(
-				fields={'Alive endpoint': f'• {endpoint_str}'},
-				add_meta_info=False)
 
-		# Add endpoint to results
-		line['_cmd'] = cmd
-		line['final_url'] = http_url
-		line['endpoint_id'] = endpoint.id
-		line['endpoint_created'] = created
-		line['is_redirect'] = is_redirect
-		results.append(line)
+def process_httpx_line(self, line, cmd, ctx={}):
+    """处理httpx的单行输出结果
+    
+    Args:
+        line (dict): httpx命令输出的JSON行
+        ctx (dict): 上下文信息
+        
+    Returns:
+        tuple: (处理后的结果, 端点ID) 或 None
+    """
+    # No response from endpoint
+    if line.get('failed', False):
+        return None
 
-		# Add technology objects to DB
-		for technology in techs:
-			tech, _ = Technology.objects.get_or_create(name=technology)
-			endpoint.techs.add(tech)
-			if is_ran_from_subdomain_scan:
-				subdomain.technologies.add(tech)
-				subdomain.save()
-			endpoint.save()
-		techs_str = ', '.join([f'`{tech}`' for tech in techs])
-		self.notify(
-			fields={'Technologies': techs_str},
-			add_meta_info=False)
+    # Parse httpx output
+    host = line.get('host', '')
+    content_length = line.get('content_length', 0)
+    http_status = line.get('status_code')
+    http_url, is_redirect = extract_httpx_url(line)
+    page_title = line.get('title')
+    webserver = line.get('webserver')
+    cdn = line.get('cdn', False)
+    rt = line.get('time')
+    techs = line.get('tech', [])
+    cname = line.get('cname', '')
+    content_type = line.get('content_type', '')
+    response_time = -1
+    if rt:
+        response_time = float(''.join(ch for ch in rt if not ch.isalpha()))
+        if rt[-2:] == 'ms':
+            response_time = response_time / 1000
 
-		# Add IP objects for 'a' records to DB
-		a_records = line.get('a', [])
-		for ip_address in a_records:
-			ip, created = save_ip_address(
-				ip_address,
-				subdomain,
-				subscan=self.subscan,
-				cdn=cdn)
-		ips_str = '• ' + '\n• '.join([f'`{ip}`' for ip in a_records])
-		self.notify(
-			fields={'IPs': ips_str},
-			add_meta_info=False)
+    # Create Subdomain object in DB
+    subdomain_name = get_subdomain_from_url(http_url)
+    subdomain, _ = save_subdomain(subdomain_name, ctx=ctx)
 
-		# Add IP object for host in DB
-		if host:
-			ip, created = save_ip_address(
-				host,
-				subdomain,
-				subscan=self.subscan,
-				cdn=cdn)
-			self.notify(
-				fields={'IPs': f'• `{ip.address}`'},
-				add_meta_info=False)
+    if not subdomain:
+        return None
 
-		# Save subdomain and endpoint
-		if is_ran_from_subdomain_scan:
-			# save subdomain stuffs
-			subdomain.http_url = http_url
-			subdomain.http_status = http_status
-			subdomain.page_title = page_title
-			subdomain.content_length = content_length
-			subdomain.webserver = webserver
-			subdomain.response_time = response_time
-			subdomain.content_type = content_type
-			subdomain.cname = ','.join(cname)
-			subdomain.is_cdn = cdn
-			if cdn:
-				subdomain.cdn_name = line.get('cdn_name')
-			subdomain.save()
-		endpoint.save()
-		endpoint_ids.append(endpoint.id)
+    # Save default HTTP URL to endpoint object in DB
+    endpoint, created = save_endpoint(
+        http_url,
+        crawl=False,
+        ctx=ctx,
+        subdomain=subdomain,
+        is_default=self.is_ran_from_subdomain_scan if hasattr(self, 'is_ran_from_subdomain_scan') else False
+    )
+    if not endpoint:
+        return None
+        
+    endpoint.http_status = http_status
+    endpoint.page_title = page_title
+    endpoint.content_length = content_length
+    endpoint.webserver = webserver
+    endpoint.response_time = response_time
+    endpoint.content_type = content_type
+    endpoint.save()
+    endpoint_str = f'{http_url} [{http_status}] `{content_length}B` `{webserver}` `{rt}`'
+    logger.warning(endpoint_str)
+    if endpoint and endpoint.is_alive and endpoint.http_status != 403:
+        self.notify(
+            fields={'Alive endpoint': f'• {endpoint_str}'},
+            add_meta_info=False)
 
-	if should_remove_duplicate_endpoints:
-		# Remove 'fake' alive endpoints that are just redirects to the same page
-		remove_duplicate_endpoints(
-			self.scan_id,
-			self.domain_id,
-			self.subdomain_id,
-			filter_ids=endpoint_ids
-		)
+    # Add endpoint to results
+    line['_cmd'] = cmd
+    line['final_url'] = http_url
+    line['endpoint_id'] = endpoint.id
+    line['endpoint_created'] = created
+    line['is_redirect'] = is_redirect
 
-	# Remove input file
-	run_command(
-		f'rm {input_path}',
-		shell=True,
-		history_file=self.history_file,
-		scan_id=self.scan_id,
-		activity_id=self.activity_id)
+    # Add technology objects to DB
+    for technology in techs:
+        tech, _ = Technology.objects.get_or_create(name=technology)
+        endpoint.techs.add(tech)
+        if hasattr(self, 'is_ran_from_subdomain_scan') and self.is_ran_from_subdomain_scan:
+            subdomain.technologies.add(tech)
+            subdomain.save()
+        endpoint.save()
+    techs_str = ', '.join([f'`{tech}`' for tech in techs])
+    self.notify(
+        fields={'Technologies': techs_str},
+        add_meta_info=False)
 
-	return results
+    # Add IP objects for 'a' records to DB
+    a_records = line.get('a', [])
+    for ip_address in a_records:
+        ip, created = save_ip_address(
+            ip_address,
+            subdomain,
+            subscan=self.subscan if hasattr(self, 'subscan') else None,
+            cdn=cdn)
+    ips_str = '• ' + '\n• '.join([f'`{ip}`' for ip in a_records])
+    self.notify(
+        fields={'IPs': ips_str},
+        add_meta_info=False)
+
+    # Add IP object for host in DB
+    if host:
+        ip, created = save_ip_address(
+            host,
+            subdomain,
+            subscan=self.subscan if hasattr(self, 'subscan') else None,
+            cdn=cdn)
+        self.notify(
+            fields={'IPs': f'• `{ip.address}`'},
+            add_meta_info=False)
+
+    # Save subdomain and endpoint
+    if hasattr(self, 'is_ran_from_subdomain_scan') and self.is_ran_from_subdomain_scan:
+        # save subdomain stuffs
+        subdomain.http_url = http_url
+        subdomain.http_status = http_status
+        subdomain.page_title = page_title
+        subdomain.content_length = content_length
+        subdomain.webserver = webserver
+        subdomain.response_time = response_time
+        subdomain.content_type = content_type
+        subdomain.cname = ','.join(cname)
+        subdomain.is_cdn = cdn
+        if cdn:
+            subdomain.cdn_name = line.get('cdn_name')
+        subdomain.save()
+    endpoint.save()
+
+    return line, endpoint.id
 
 
 #---------------------#
